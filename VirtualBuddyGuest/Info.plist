@@ -8,7 +8,7 @@
 	<dict>
 		<key>AllowProcesses</key>
 		<dict>
-			<key>8C7439RJLG</key>
+			<key>RLHAQ44Q53</key>
 			<array>
 				<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			</array>

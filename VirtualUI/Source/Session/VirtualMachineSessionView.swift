@@ -106,6 +106,10 @@ public struct VirtualMachineSessionView: View {
                 ToolbarSpacer(.fixed)
             }
 
+            ToolbarItem(placement: .primaryAction) {
+                SnapshotsToolbarButton()
+            }
+
             ToolbarItemGroup(placement: .primaryAction) {
                 VirtualMachineStateControls()
             }

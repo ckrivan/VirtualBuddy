@@ -24,4 +24,4 @@ Tests/Private
 Design/Icon
 Build/
 MockServer/
-CIProjectVersion.xcconfig
+CIProjectVersion.xcconfigbuild/

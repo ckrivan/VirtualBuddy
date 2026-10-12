@@ -1,6 +1,7 @@
 // ENABLE_SPARKLE = Enables building with Sparkle for automatic updates
 // ENABLE_USERDEFAULTS_SYNC = Enables the user defaults sync feature
-OTHER_SWIFT_FLAGS = -D ENABLE_SPARKLE $(inherited)
+// Disabled in this fork so upstream releases never replace it.
+OTHER_SWIFT_FLAGS = $(inherited)
 
 // The BETA flag must be present in all targets, hence why these are here instead of in AppTarget.xcconfig
 OTHER_SWIFT_FLAGS[config=Beta_Debug][sdk=*][arch=*] = -D BETA $(inherited)

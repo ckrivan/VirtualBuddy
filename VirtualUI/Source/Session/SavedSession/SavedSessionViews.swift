@@ -75,7 +75,7 @@ struct SavedSessionDetailsSection: View {
     var body: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
-                Text("To keep this point for later, duplicate the saved VM before resuming it. Resuming a copy continues that copy.")
+                Text("To keep this point for later, take a snapshot before resuming. You can revert to a snapshot as many times as you like.")
 
                 Text("Shared host folders and remote services stay live. Their contents are not preserved or rolled back. A saved session is not a backup, and it may stop working after macOS or VirtualBuddy updates.")
                     .foregroundStyle(.secondary)
