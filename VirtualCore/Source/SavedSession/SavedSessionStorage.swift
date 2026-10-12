@@ -127,13 +127,16 @@ struct SavedSessionStorage: Sendable {
 
         try removeTransientDirectories()
 
+        return try stageCapture(plan, at: layout.stagingURL(for: plan.sessionID))
+    }
+
+    /// Clones every resource of the plan into a new package at `stagingURL`. Snapshots stage their packages through this too.
+    func stageCapture(_ plan: SavedSessionCapturePlan, at stagingURL: URL) throws -> SavedSessionStagedCapture {
         for resource in plan.resources where !fileSystem.exists(resource.sourceURL) {
             throw SavedSessionError.missingResource(resource.sourceURL.lastPathComponent)
         }
 
         try ensureEnoughSpace(forMemorySize: plan.memorySize)
-
-        let stagingURL = layout.stagingURL(for: plan.sessionID)
 
         do {
             try fileSystem.createDirectory(stagingURL)
@@ -192,6 +195,11 @@ struct SavedSessionStorage: Sendable {
     ///
     /// The framework state file must already have been written to ``SavedSessionStagedCapture/stateFileURL``.
     func publish(_ staged: SavedSessionStagedCapture) throws -> VBSavedSessionDescriptor {
+        try publish(staged, to: layout.packageURL)
+    }
+
+    /// Validates the staged package and publishes it at `destinationURL` with an atomic rename.
+    func publish(_ staged: SavedSessionStagedCapture, to destinationURL: URL) throws -> VBSavedSessionDescriptor {
         do {
             guard let stateSize = fileSystem.byteCount(of: staged.stateFileURL), stateSize > 0 else {
                 throw SavedSessionError.missingResource(SavedSessionLayout.stateFileName)
@@ -222,16 +230,16 @@ struct SavedSessionStorage: Sendable {
             try Task.checkCancellation()
 
             try fileSystem.synchronizeDirectory(staged.stagingURL)
-            try fileSystem.move(from: staged.stagingURL, to: layout.packageURL, replacingExisting: false)
+            try fileSystem.move(from: staged.stagingURL, to: destinationURL, replacingExisting: false)
 
             /// The package is visible from here on. A failure to flush the directory doesn't make it incomplete.
-            try? fileSystem.synchronizeDirectory(layout.bundleURL)
+            try? fileSystem.synchronizeDirectory(destinationURL.deletingLastPathComponent())
 
             return VBSavedSessionDescriptor(
                 id: manifest.id,
                 date: manifest.date,
                 status: .ready,
-                screenshotURL: manifest.screenshotFileName.map { layout.packageURL.appending(path: $0) }
+                screenshotURL: manifest.screenshotFileName.map { destinationURL.appending(path: $0) }
             )
         } catch {
             try? fileSystem.remove(staged.stagingURL)
@@ -449,13 +457,22 @@ struct SavedSessionStorage: Sendable {
 
     private func readManifest() throws -> SavedSessionManifest {
         /// The directories this works in must be real directories, or everything in them could be somewhere else.
-        guard !fileSystem.isSymbolicLink(layout.packageURL), !fileSystem.isSymbolicLink(layout.transactionURL) else {
+        guard !fileSystem.isSymbolicLink(layout.transactionURL) else {
+            throw SavedSessionError.invalidManifest("The saved session is not stored inside the virtual machine.")
+        }
+
+        return try readManifest(inPackageAt: layout.packageURL)
+    }
+
+    /// Reads and checks the version of the manifest of a package. Snapshots are packages in the same format.
+    func readManifest(inPackageAt packageURL: URL) throws -> SavedSessionManifest {
+        guard !fileSystem.isSymbolicLink(packageURL) else {
             throw SavedSessionError.invalidManifest("The saved session is not stored inside the virtual machine.")
         }
 
         let manifest: SavedSessionManifest
         do {
-            manifest = try Self.decoder.decode(SavedSessionManifest.self, from: fileSystem.read(layout.manifestURL))
+            manifest = try Self.decoder.decode(SavedSessionManifest.self, from: fileSystem.read(packageURL.appending(path: SavedSessionLayout.manifestFileName)))
         } catch {
             throw SavedSessionError.invalidManifest("The manifest could not be read.")
         }
@@ -468,7 +485,7 @@ struct SavedSessionStorage: Sendable {
         return manifest
     }
 
-    private func validate(_ manifest: SavedSessionManifest, in packageURL: URL) throws {
+    func validate(_ manifest: SavedSessionManifest, in packageURL: URL) throws {
         if let savedECID = manifest.hostECID, let hostECID, savedECID != hostECID {
             throw SavedSessionError.hostMismatch
         }

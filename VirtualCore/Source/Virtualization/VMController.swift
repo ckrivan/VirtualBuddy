@@ -172,6 +172,14 @@ public final class VMController: ObservableObject {
     /// `true` between resuming a restored session and cleaning up the package it was restored from.
     private var isRestoreCompletionPending = false
 
+    /// The snapshots of this virtual machine, oldest first.
+    @Published
+    public private(set) var snapshots: [VBSnapshot] = []
+
+    /// `true` while a snapshot is being taken, reverted to, renamed or deleted.
+    @Published
+    public private(set) var isPerformingSnapshotOperation = false
+
     public init(with vm: VBVirtualMachine, library: VMLibraryController, options: VMSessionOptions? = nil) {
         self.id = vm.id
         self.name = vm.name
@@ -189,6 +197,8 @@ public final class VMController: ObservableObject {
         }
 
         self.state = restingState
+
+        self.snapshots = snapshotStorage.list()
 
         /// Ensure configuration is persisted whenever it changes.
         $virtualMachineModel
@@ -349,6 +359,9 @@ public final class VMController: ObservableObject {
         if case .recoveryRequired(let issue) = state, issue.isStopFailure {
             throw SavedSessionError.recoveryRequired(issue)
         }
+
+        /// A revert to a disk snapshot that was interrupted has to finish before the disks are used.
+        try await recoverInterruptedSnapshotRevert()
 
         if let session = lookUpSavedSession(), !discardingSavedSession {
             guard !options.requestsSpecialBoot else { throw SavedSessionError.discardConfirmationRequired }
@@ -993,6 +1006,235 @@ public final class VMController: ObservableObject {
             virtualMachineModel.reloadSavedSession()
             state = restingState
         }
+    }
+
+    // MARK: Snapshots
+
+    private var snapshotStorage: VMSnapshotStorage { VMSnapshotStorage(bundleURL: virtualMachineModel.bundleURL) }
+
+    public func reloadSnapshots() {
+        snapshots = snapshotStorage.list()
+    }
+
+    /// What taking a snapshot right now would capture.
+    public enum SnapshotCapture: Equatable {
+        /// Memory, device state and disks of the running (or paused) virtual machine, which keeps running.
+        case live
+        /// The saved session, which already holds memory, device state and disks.
+        case savedSession
+        /// The disks of the virtual machine, which is shut down.
+        case disk
+        /// Nothing can be captured, for the reason given.
+        case unavailable(String)
+    }
+
+    public var snapshotCapture: SnapshotCapture {
+        switch state {
+        case .running, .paused:
+            if saveEligibility.isSupported { return .live }
+            if !saveEligibility.isApplicable { return .unavailable("Shut down this virtual machine to take a snapshot of its disks.") }
+            return .unavailable(saveEligibility.explanationForUser ?? "Snapshots aren’t available for this virtual machine.")
+
+        case .saved:
+            return .savedSession
+
+        case .idle, .stopped:
+            if let issue = diskSnapshotIssue { return .unavailable(issue.explanation) }
+            return .disk
+
+        case .recoveryRequired:
+            return .unavailable("Resolve the problem with the saved session before taking a snapshot.")
+
+        case .starting, .resizingDisk, .saving, .restoring:
+            return .unavailable("Wait for the current operation to finish.")
+        }
+    }
+
+    private var diskSnapshotIssue: SavedSessionEligibility.Issue? {
+        if virtualMachineModel.needsInstall { return .installationIncomplete }
+
+        for device in virtualMachineModel.configuration.hardware.storageDevices where device.isEnabled {
+            if case .customImage = device.backing { return .externalDiskImage(device.displayName) }
+        }
+
+        if !bundleSupportsCloning { return .volumeDoesNotSupportCloning }
+
+        return nil
+    }
+
+    /// Takes a snapshot of the virtual machine as it is right now. A running virtual machine is paused while its
+    /// memory is saved, then continues running.
+    @discardableResult
+    public func takeSnapshot(named name: String) async throws -> VBSnapshot {
+        try await performSnapshotOperation {
+            await library.waitForDuplication(of: virtualMachineModel.id)
+
+            switch snapshotCapture {
+            case .live:
+                return try await takeLiveSnapshot(named: name)
+
+            case .savedSession:
+                let storage = snapshotStorage
+                return try await performOffMainActor { try storage.captureSavedSession(named: name) }
+
+            case .disk:
+                try await recoverInterruptedSnapshotRevert()
+
+                let resources = try virtualMachineModel.diskSnapshotResources()
+                let screenshotURL = virtualMachineModel.snapshotScreenshotURL
+                let storage = snapshotStorage
+
+                return try await performOffMainActor { try storage.captureDisks(resources, screenshotSourceURL: screenshotURL, named: name) }
+
+            case .unavailable(let reason):
+                throw VMSnapshotError.unusable(reason)
+            }
+        }
+    }
+
+    private func takeLiveSnapshot(named name: String) async throws -> VBSnapshot {
+        let instance = try ensureInstance()
+        let vm = try instance.virtualMachine
+
+        if let issue = saveEligibility.primaryIssue {
+            throw SavedSessionError.notEligible(issue)
+        }
+
+        await finishRestoreIfPending()
+
+        let storage = snapshotStorage
+        var wasRunning = false
+        let snapshot: VBSnapshot
+
+        do {
+            state = .saving(vm, .pausing)
+            wasRunning = try await instance.pauseForSaving()
+
+            let plan = try instance.makeSavedSessionCapturePlan(wasPausedBeforeSave: !wasRunning)
+
+            state = .saving(vm, .cloningStorage)
+            let staged = try await performOffMainActor { try storage.stageLiveCapture(plan) }
+
+            do {
+                state = .saving(vm, .savingMemory)
+                try await instance.saveMachineState(to: staged.stateFileURL)
+
+                state = .saving(vm, .finalizing)
+                snapshot = try await performOffMainActor { try storage.publishLiveCapture(staged, named: name) }
+            } catch {
+                storage.abandon(staged)
+                throw error
+            }
+        } catch {
+            logger.error("Taking snapshot failed: \(error, privacy: .public)")
+            await returnToConditionBeforeSave(instance: instance, wasRunning: wasRunning)
+            throw error
+        }
+
+        /// Saving leaves the virtual machine paused and otherwise unchanged, so it simply continues.
+        await returnToConditionBeforeSave(instance: instance, wasRunning: wasRunning)
+
+        unhideCursor()
+
+        return snapshot
+    }
+
+    /// Reverts the virtual machine to a snapshot. Whatever the virtual machine is doing, including its saved session,
+    /// is thrown away: callers must confirm this with the user first.
+    ///
+    /// A live snapshot resumes right away. A disk snapshot leaves the virtual machine shut down.
+    public func revertToSnapshot(_ id: VBSnapshot.ID) async throws {
+        try await performSnapshotOperation {
+            await library.waitForDuplication(of: virtualMachineModel.id)
+
+            guard let snapshot = snapshotStorage.list().first(where: { $0.id == id }) else { throw VMSnapshotError.notFound }
+            if let problem = snapshot.problem { throw VMSnapshotError.unusable(problem) }
+
+            try await stopForRevert()
+
+            let storage = snapshotStorage
+
+            /// The saved session belongs to the state that's being thrown away.
+            try await performOffMainActor { try storage.sessions.discard() }
+            virtualMachineModel.reloadSavedSession()
+
+            switch snapshot.kind {
+            case .live:
+                try await performOffMainActor { try storage.installAsSavedSession(id) }
+                virtualMachineModel.reloadSavedSession()
+
+                do {
+                    try await resumeSavedSession()
+                } catch {
+                    /// A failure before the guest ran leaves the disks as they were, so the clone of the snapshot is only clutter.
+                    /// A failure after it ran leaves the restored virtual machine paused, which is a successful revert.
+                    if !state.isPaused && !state.isRunning {
+                        try? await performOffMainActor { try storage.sessions.discard() }
+                        virtualMachineModel.reloadSavedSession()
+                        state = .stopped(error)
+                    }
+                    throw error
+                }
+
+            case .disk:
+                try await performOffMainActor { try storage.revertDisks(to: id) }
+                virtualMachineModel.reloadSavedSession()
+                state = restingState
+            }
+
+            library.reload(animated: false)
+        }
+    }
+
+    /// Stops whatever is running without waiting for the guest, since its state is about to be replaced anyway.
+    private func stopForRevert() async throws {
+        if case .recoveryRequired(let issue) = state, issue.isStopFailure {
+            throw SavedSessionError.recoveryRequired(issue)
+        }
+
+        guard state.isRunning || state.isPaused, let instance else { return }
+
+        try await instance.forceStop()
+
+        self.instance = nil
+        state = .stopped(nil)
+
+        await finishRestoreIfPending()
+    }
+
+    public func renameSnapshot(_ id: VBSnapshot.ID, to name: String) async throws {
+        try await performSnapshotOperation {
+            let storage = snapshotStorage
+            try await performOffMainActor { try storage.rename(id, to: name) }
+        }
+    }
+
+    public func deleteSnapshot(_ id: VBSnapshot.ID) async throws {
+        try await performSnapshotOperation {
+            await library.waitForDuplication(of: virtualMachineModel.id)
+
+            let storage = snapshotStorage
+            try await performOffMainActor { try storage.delete(id) }
+        }
+    }
+
+    private func performSnapshotOperation<T>(_ operation: () async throws -> T) async throws -> T {
+        try await lease.perform {
+            isPerformingSnapshotOperation = true
+            defer {
+                isPerformingSnapshotOperation = false
+                reloadSnapshots()
+            }
+
+            return try await operation()
+        }
+    }
+
+    private func recoverInterruptedSnapshotRevert() async throws {
+        guard !state.isRunning, !state.isPaused else { return }
+
+        let storage = snapshotStorage
+        try await performOffMainActor { try storage.recoverInterruptedRevert() }
     }
 
     private func ensureInstance() throws -> VMInstance {

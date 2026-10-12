@@ -162,6 +162,8 @@ struct SavedSessionLayout: Sendable {
     static let stagedDirectoryName = "Staged"
     static let backupDirectoryName = "Backup"
     static let guestAdditionsMediaWorkingPath = "\(mediaDirectoryName)/GuestAdditions.img"
+    /// The EFI variable store of a Linux virtual machine. Only disk snapshots capture it.
+    static let linuxNVRAMWorkingPath = "\(VBVirtualMachine.metadataDirectoryName)/nvram"
 
     let bundleURL: URL
 
@@ -209,11 +211,12 @@ struct SavedSessionLayout: Sendable {
     /// Where a resource may live while the virtual machine runs: directly in the bundle, with a name that
     /// doesn't collide with the saved session machinery or the virtual machine's own data, or the guest additions image location.
     static func isPermittedWorkingPath(_ path: String) -> Bool {
-        if path == guestAdditionsMediaWorkingPath { return true }
+        if path == guestAdditionsMediaWorkingPath || path == linuxNVRAMWorkingPath { return true }
 
         return isSimpleName(path)
             && path != packageName
             && path != VBVirtualMachine.metadataDirectoryName
+            && path != VMSnapshotLayout.directoryName
             && !isTransientName(path)
     }
 
@@ -234,6 +237,7 @@ struct SavedSessionLayout: Sendable {
             || name.hasPrefix(obsoletePrefix)
             || name == transactionName
             || name == mediaDirectoryName
+            || name.hasSuffix(VMSnapshotLayout.incomingSuffix)
     }
 }
 
