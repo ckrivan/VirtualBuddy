@@ -209,7 +209,7 @@ struct VMSnapshotStorage: Sendable {
                     throw SavedSessionError.missingResource(source.sourceURL.lastPathComponent)
                 }
 
-                try fileSystem.clone(from: source.sourceURL, to: resourcesURL.appending(path: name))
+                try fileSystem.capture(source, to: resourcesURL.appending(path: name))
 
                 captured.append(SavedSessionManifest.Resource(
                     id: source.id,

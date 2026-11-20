@@ -155,7 +155,7 @@ struct SavedSessionStorage: Sendable {
                     throw SavedSessionError.missingResource(source.sourceURL.lastPathComponent)
                 }
 
-                try fileSystem.clone(from: source.sourceURL, to: destination)
+                try fileSystem.capture(source, to: destination)
 
                 guard fileSystem.byteCount(of: destination) == sourceSize else {
                     throw SavedSessionError.resourceSizeMismatch(source.sourceURL.lastPathComponent)

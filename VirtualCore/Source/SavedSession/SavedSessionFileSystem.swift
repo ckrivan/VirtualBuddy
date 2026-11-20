@@ -27,6 +27,23 @@ protocol SavedSessionFileSystem: Sendable {
     func synchronizeFile(_ url: URL) throws
 }
 
+extension SavedSessionFileSystem {
+    /// Brings a resource into a package that's being captured.
+    ///
+    /// Resources are cloned, which makes capturing a disk instant and free of storage cost. The guest additions media
+    /// is the one resource that doesn't live in the virtual machine's bundle: it comes from the default library, which
+    /// can be on a different volume than the bundle, and a clone can't cross volumes. It's small and never modified,
+    /// so it's copied when it can't be cloned. Every other resource still fails rather than being copied in full.
+    func capture(_ source: SavedSessionCapturePlan.ResourceSource, to destination: URL) throws {
+        do {
+            try clone(from: source.sourceURL, to: destination)
+        } catch SavedSessionError.cloneUnsupported where source.role == .guestAdditionsMedia {
+            try copy(from: source.sourceURL, to: destination)
+            try synchronizeFile(destination)
+        }
+    }
+}
+
 struct DefaultSavedSessionFileSystem: SavedSessionFileSystem {
     func exists(_ url: URL) -> Bool {
         var info = stat()

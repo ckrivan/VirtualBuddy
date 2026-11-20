@@ -20,6 +20,8 @@ final class FaultInjectingFileSystem: SavedSessionFileSystem, @unchecked Sendabl
     var failingOperation: Int?
     var mode = Mode.transient
     var failure: Error = InjectedFailure()
+    /// Sources that behave as if they were on a different volume than the destination, so they can't be cloned.
+    var isOnAnotherVolume: (URL) -> Bool = { _ in false }
 
     /// How many mutating operations have been attempted.
     var operationCount: Int { lock.withLock { counter } }
@@ -45,7 +47,11 @@ final class FaultInjectingFileSystem: SavedSessionFileSystem, @unchecked Sendabl
 
     func createDirectory(_ url: URL) throws { try mutate(); try base.createDirectory(url) }
     func copy(from source: URL, to destination: URL) throws { try mutate(); try base.copy(from: source, to: destination) }
-    func clone(from source: URL, to destination: URL) throws { try mutate(); try base.clone(from: source, to: destination) }
+    func clone(from source: URL, to destination: URL) throws {
+        try mutate()
+        guard !isOnAnotherVolume(source) else { throw SavedSessionError.cloneUnsupported(source) }
+        try base.clone(from: source, to: destination)
+    }
     func move(from source: URL, to destination: URL, replacingExisting: Bool) throws {
         try mutate()
         try base.move(from: source, to: destination, replacingExisting: replacingExisting)
@@ -175,6 +181,34 @@ final class SavedSessionStorageTests: XCTestCase {
         }
 
         XCTAssertNil(storage.inspect())
+        try assertNoTransientLeftovers()
+    }
+
+    func testGuestAdditionsMediaOnAnotherVolumeIsCopied() throws {
+        let fileSystem = FaultInjectingFileSystem()
+        fileSystem.isOnAnotherVolume = { $0.lastPathComponent.hasPrefix("media-") }
+        let storage = makeStorage(fileSystem)
+
+        try capture(with: storage, plan: makePlan(withMedia: true))
+
+        let resourcesURL = storage.layout.packageURL.appending(path: SavedSessionLayout.resourcesDirectoryName)
+        let media = try XCTUnwrap(try FileManager.default.contentsOfDirectory(atPath: resourcesURL.path).first {
+            $0.hasPrefix(SavedSessionManifest.Role.guestAdditionsMedia.rawValue)
+        })
+        let captured = try Data(contentsOf: resourcesURL.appending(path: media))
+        XCTAssertEqual(captured, Data("guest additions".utf8))
+        try assertNoTransientLeftovers()
+    }
+
+    func testDiskOnAnotherVolumeIsNotCopied() throws {
+        let fileSystem = FaultInjectingFileSystem()
+        fileSystem.isOnAnotherVolume = { $0.lastPathComponent == "Disk.img" }
+        let storage = makeStorage(fileSystem)
+
+        XCTAssertThrowsError(try capture(with: storage)) { error in
+            guard case SavedSessionError.cloneUnsupported = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.layout.packageURL.path))
         try assertNoTransientLeftovers()
     }
 
